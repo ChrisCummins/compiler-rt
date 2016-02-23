@@ -1117,8 +1117,8 @@ TEST(MemorySanitizer, gethostbyname_r_erange) {
   struct hostent he;
   struct hostent *result;
   int err;
-  int res = gethostbyname_r("localhost", &he, buf, sizeof(buf), &result, &err);
-  ASSERT_EQ(ERANGE, res);
+  gethostbyname_r("localhost", &he, buf, sizeof(buf), &result, &err);
+  ASSERT_EQ(ERANGE, errno);
   EXPECT_NOT_POISONED(err);
 }
 
@@ -2389,13 +2389,19 @@ TEST(MemorySanitizer, Invoke) {
 
 TEST(MemorySanitizer, ptrtoint) {
   // Test that shadow is propagated through pointer-to-integer conversion.
-  void* p = (void*)0xABCD;
-  __msan_poison(((char*)&p) + 1, sizeof(p));
-  EXPECT_NOT_POISONED((((uintptr_t)p) & 0xFF) == 0);
+  unsigned char c = 0;
+  __msan_poison(&c, 1);
+  uintptr_t u = (uintptr_t)c << 8;
+  EXPECT_NOT_POISONED(u & 0xFF00FF);
+  EXPECT_POISONED(u & 0xFF00);
 
-  void* q = (void*)0xABCD;
-  __msan_poison(&q, sizeof(q) - 1);
-  EXPECT_POISONED((((uintptr_t)q) & 0xFF) == 0);
+  break_optimization(&u);
+  void* p = (void*)u;
+
+  break_optimization(&p);
+  EXPECT_POISONED(p);
+  EXPECT_NOT_POISONED(((uintptr_t)p) & 0xFF00FF);
+  EXPECT_POISONED(((uintptr_t)p) & 0xFF00);
 }
 
 static void vaargsfn2(int guard, ...) {
@@ -2805,6 +2811,22 @@ TEST(MemorySanitizer, getrlimit) {
   ASSERT_EQ(result, 0);
   EXPECT_NOT_POISONED(limit.rlim_cur);
   EXPECT_NOT_POISONED(limit.rlim_max);
+
+  struct rlimit limit2;
+  __msan_poison(&limit2, sizeof(limit2));
+  result = prlimit(getpid(), RLIMIT_DATA, &limit, &limit2);
+  ASSERT_EQ(result, 0);
+  EXPECT_NOT_POISONED(limit2.rlim_cur);
+  EXPECT_NOT_POISONED(limit2.rlim_max);
+
+  __msan_poison(&limit, sizeof(limit));
+  result = prlimit(getpid(), RLIMIT_DATA, nullptr, &limit);
+  ASSERT_EQ(result, 0);
+  EXPECT_NOT_POISONED(limit.rlim_cur);
+  EXPECT_NOT_POISONED(limit.rlim_max);
+
+  result = prlimit(getpid(), RLIMIT_DATA, &limit, nullptr);
+  ASSERT_EQ(result, 0);
 }
 
 TEST(MemorySanitizer, getrusage) {
