@@ -158,7 +158,6 @@ bool SanitizerGetThreadName(char *name, int max_len) {
 
 #if !SANITIZER_FREEBSD && !SANITIZER_ANDROID && !SANITIZER_GO
 static uptr g_tls_size;
-#endif
 
 #ifdef __i386__
 # define DL_INTERNAL_FUNCTION __attribute__((regparm(3), stdcall))
@@ -166,26 +165,7 @@ static uptr g_tls_size;
 # define DL_INTERNAL_FUNCTION
 #endif
 
-#if defined(__mips__) || defined(__powerpc64__)
-// TlsPreTcbSize includes size of struct pthread_descr and size of tcb
-// head structure. It lies before the static tls blocks.
-static uptr TlsPreTcbSize() {
-# if defined(__mips__)
-  const uptr kTcbHead = 16; // sizeof (tcbhead_t)
-# elif defined(__powerpc64__)
-  const uptr kTcbHead = 88; // sizeof (tcbhead_t)
-# endif
-  const uptr kTlsAlign = 16;
-  const uptr kTlsPreTcbSize =
-    (ThreadDescriptorSize() + kTcbHead + kTlsAlign - 1) & ~(kTlsAlign - 1);
-  InitTlsSize();
-  g_tls_size = (g_tls_size + kTlsPreTcbSize + kTlsAlign -1) & ~(kTlsAlign - 1);
-  return kTlsPreTcbSize;
-}
-#endif
-
 void InitTlsSize() {
-#if !SANITIZER_FREEBSD && !SANITIZER_ANDROID && !SANITIZER_GO
 // all current supported platforms have 16 bytes stack alignment
   const size_t kStackAlign = 16;
   typedef void (*get_tls_func)(size_t*, size_t*) DL_INTERNAL_FUNCTION;
@@ -201,11 +181,13 @@ void InitTlsSize() {
   if (tls_align < kStackAlign)
     tls_align = kStackAlign;
   g_tls_size = RoundUpTo(tls_size, tls_align);
-#endif  // !SANITIZER_FREEBSD && !SANITIZER_ANDROID && !SANITIZER_GO
 }
+#else
+void InitTlsSize() { }
+#endif  // !SANITIZER_FREEBSD && !SANITIZER_ANDROID && !SANITIZER_GO
 
 #if (defined(__x86_64__) || defined(__i386__) || defined(__mips__) \
-    || defined(__aarch64__) || defined(__powerpc64__)) \
+    || defined(__aarch64__) || defined(__powerpc64__) || defined(__s390__)) \
     && SANITIZER_LINUX && !SANITIZER_ANDROID
 // sizeof(struct pthread) from glibc.
 static atomic_uintptr_t kThreadDescriptorSize;
@@ -267,6 +249,9 @@ uptr ThreadDescriptorSize() {
   val = 1776; // from glibc.ppc64le 2.20-8.fc21
   atomic_store(&kThreadDescriptorSize, val, memory_order_relaxed);
   return val;
+#elif defined(__s390__)
+  val = FIRST_32_SECOND_64(1152, 1776); // valid for glibc 2.22
+  atomic_store(&kThreadDescriptorSize, val, memory_order_relaxed);
 #endif
   return 0;
 }
@@ -277,6 +262,24 @@ const uptr kThreadSelfOffset = FIRST_32_SECOND_64(8, 16);
 uptr ThreadSelfOffset() {
   return kThreadSelfOffset;
 }
+
+#if defined(__mips__) || defined(__powerpc64__)
+// TlsPreTcbSize includes size of struct pthread_descr and size of tcb
+// head structure. It lies before the static tls blocks.
+static uptr TlsPreTcbSize() {
+# if defined(__mips__)
+  const uptr kTcbHead = 16; // sizeof (tcbhead_t)
+# elif defined(__powerpc64__)
+  const uptr kTcbHead = 88; // sizeof (tcbhead_t)
+# endif
+  const uptr kTlsAlign = 16;
+  const uptr kTlsPreTcbSize =
+    (ThreadDescriptorSize() + kTcbHead + kTlsAlign - 1) & ~(kTlsAlign - 1);
+  InitTlsSize();
+  g_tls_size = (g_tls_size + kTlsPreTcbSize + kTlsAlign -1) & ~(kTlsAlign - 1);
+  return kTlsPreTcbSize;
+}
+#endif
 
 uptr ThreadSelf() {
   uptr descr_addr;
@@ -296,7 +299,7 @@ uptr ThreadSelf() {
                 rdhwr %0,$29;\
                 .set pop" : "=r" (thread_pointer));
   descr_addr = thread_pointer - kTlsTcbOffset - TlsPreTcbSize();
-# elif defined(__aarch64__)
+# elif defined(__aarch64__) || defined(__s390__)
   descr_addr = reinterpret_cast<uptr>(__builtin_thread_pointer());
 # elif defined(__powerpc64__)
   // PPC64LE uses TLS variant I. The thread pointer (in GPR 13)
@@ -337,7 +340,7 @@ uptr ThreadSelf() {
 #if !SANITIZER_GO
 static void GetTls(uptr *addr, uptr *size) {
 #if SANITIZER_LINUX && !SANITIZER_ANDROID
-# if defined(__x86_64__) || defined(__i386__)
+# if defined(__x86_64__) || defined(__i386__) || defined(__s390__)
   *addr = ThreadSelf();
   *size = GetTlsSize();
   *addr -= *size;

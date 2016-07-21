@@ -4,7 +4,7 @@ set(PROFILE_LIT_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
 set(PROFILE_TESTSUITES)
 set(PROFILE_TEST_DEPS ${SANITIZER_COMMON_LIT_TEST_DEPS})
 if(NOT COMPILER_RT_STANDALONE_BUILD)
-  list(APPEND PROFILE_TEST_DEPS profile llvm-profdata)
+  list(APPEND PROFILE_TEST_DEPS profile llvm-profdata llvm-cov)
 endif()
 
 set(PROFILE_TEST_ARCH ${PROFILE_SUPPORTED_ARCH})
@@ -32,4 +32,4 @@ endforeach()
 add_lit_testsuite(check-profile "Running the profile tests"
   ${PROFILE_TESTSUITES}
   DEPENDS ${PROFILE_TEST_DEPS})
-set_target_properties(check-profile PROPERTIES FOLDER "Profile tests")
+set_target_properties(check-profile PROPERTIES FOLDER "Compiler-RT Misc")

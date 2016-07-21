@@ -28,6 +28,7 @@
 #include "sanitizer_mutex.h"
 #include "sanitizer_placement_new.h"
 #include "sanitizer_stacktrace.h"
+#include "sanitizer_symbolizer.h"
 
 namespace __sanitizer {
 
@@ -97,20 +98,90 @@ void UnmapOrDie(void *addr, uptr size) {
   if (!size || !addr)
     return;
 
-  if (VirtualFree(addr, size, MEM_DECOMMIT) == 0) {
-    Report("ERROR: %s failed to "
-           "deallocate 0x%zx (%zd) bytes at address %p (error code: %d)\n",
-           SanitizerToolName, size, size, addr, GetLastError());
-    CHECK("unable to unmap" && 0);
+  MEMORY_BASIC_INFORMATION mbi;
+  CHECK(VirtualQuery(addr, &mbi, sizeof(mbi)));
+
+  // MEM_RELEASE can only be used to unmap whole regions previously mapped with
+  // VirtualAlloc. So we first try MEM_RELEASE since it is better, and if that
+  // fails try MEM_DECOMMIT.
+  if (VirtualFree(addr, 0, MEM_RELEASE) == 0) {
+    if (VirtualFree(addr, size, MEM_DECOMMIT) == 0) {
+      Report("ERROR: %s failed to "
+             "deallocate 0x%zx (%zd) bytes at address %p (error code: %d)\n",
+             SanitizerToolName, size, size, addr, GetLastError());
+      CHECK("unable to unmap" && 0);
+    }
   }
+}
+
+// We want to map a chunk of address space aligned to 'alignment'.
+void *MmapAlignedOrDie(uptr size, uptr alignment, const char *mem_type) {
+  CHECK(IsPowerOfTwo(size));
+  CHECK(IsPowerOfTwo(alignment));
+
+  // Windows will align our allocations to at least 64K.
+  alignment = Max(alignment, GetMmapGranularity());
+
+  uptr mapped_addr =
+      (uptr)VirtualAlloc(0, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (!mapped_addr)
+    ReportMmapFailureAndDie(size, mem_type, "allocate aligned", GetLastError());
+
+  // If we got it right on the first try, return. Otherwise, unmap it and go to
+  // the slow path.
+  if (IsAligned(mapped_addr, alignment))
+    return (void*)mapped_addr;
+  if (VirtualFree((void *)mapped_addr, 0, MEM_RELEASE) == 0)
+    ReportMmapFailureAndDie(size, mem_type, "deallocate", GetLastError());
+
+  // If we didn't get an aligned address, overallocate, find an aligned address,
+  // unmap, and try to allocate at that aligned address.
+  int retries = 0;
+  const int kMaxRetries = 10;
+  for (; retries < kMaxRetries &&
+         (mapped_addr == 0 || !IsAligned(mapped_addr, alignment));
+       retries++) {
+    // Overallocate size + alignment bytes.
+    mapped_addr =
+        (uptr)VirtualAlloc(0, size + alignment, MEM_RESERVE, PAGE_NOACCESS);
+    if (!mapped_addr)
+      ReportMmapFailureAndDie(size, mem_type, "allocate aligned",
+                              GetLastError());
+
+    // Find the aligned address.
+    uptr aligned_addr = RoundUpTo(mapped_addr, alignment);
+
+    // Free the overallocation.
+    if (VirtualFree((void *)mapped_addr, 0, MEM_RELEASE) == 0)
+      ReportMmapFailureAndDie(size, mem_type, "deallocate", GetLastError());
+
+    // Attempt to allocate exactly the number of bytes we need at the aligned
+    // address. This may fail for a number of reasons, in which case we continue
+    // the loop.
+    mapped_addr = (uptr)VirtualAlloc((void *)aligned_addr, size,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  }
+
+  // Fail if we can't make this work quickly.
+  if (retries == kMaxRetries && mapped_addr == 0)
+    ReportMmapFailureAndDie(size, mem_type, "allocate aligned", GetLastError());
+
+  return (void *)mapped_addr;
 }
 
 void *MmapFixedNoReserve(uptr fixed_addr, uptr size, const char *name) {
   // FIXME: is this really "NoReserve"? On Win32 this does not matter much,
   // but on Win64 it does.
-  (void)name; // unsupported
-  void *p = VirtualAlloc((LPVOID)fixed_addr, size,
-      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  (void)name;  // unsupported
+#if !SANITIZER_GO && SANITIZER_WINDOWS64
+  // On asan/Windows64, use MEM_COMMIT would result in error
+  // 1455:ERROR_COMMITMENT_LIMIT.
+  // Asan uses exception handler to commit page on demand.
+  void *p = VirtualAlloc((LPVOID)fixed_addr, size, MEM_RESERVE, PAGE_READWRITE);
+#else
+  void *p = VirtualAlloc((LPVOID)fixed_addr, size, MEM_RESERVE | MEM_COMMIT,
+                         PAGE_READWRITE);
+#endif
   if (p == 0)
     Report("ERROR: %s failed to "
            "allocate %p (%zd) bytes at %p (error code: %d)\n",
@@ -118,8 +189,18 @@ void *MmapFixedNoReserve(uptr fixed_addr, uptr size, const char *name) {
   return p;
 }
 
+// Memory space mapped by 'MmapFixedOrDie' must have been reserved by
+// 'MmapFixedNoAccess'.
 void *MmapFixedOrDie(uptr fixed_addr, uptr size) {
-  return MmapFixedNoReserve(fixed_addr, size);
+  void *p = VirtualAlloc((LPVOID)fixed_addr, size,
+      MEM_COMMIT, PAGE_READWRITE);
+  if (p == 0) {
+    char mem_type[30];
+    internal_snprintf(mem_type, sizeof(mem_type), "memory at address 0x%zx",
+                      fixed_addr);
+    ReportMmapFailureAndDie(size, mem_type, "allocate", GetLastError());
+  }
+  return p;
 }
 
 void *MmapNoReserveOrDie(uptr size, const char *mem_type) {
@@ -127,15 +208,20 @@ void *MmapNoReserveOrDie(uptr size, const char *mem_type) {
   return MmapOrDie(size, mem_type);
 }
 
-void *MmapNoAccess(uptr fixed_addr, uptr size, const char *name) {
+void *MmapFixedNoAccess(uptr fixed_addr, uptr size, const char *name) {
   (void)name; // unsupported
   void *res = VirtualAlloc((LPVOID)fixed_addr, size,
-                           MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+                           MEM_RESERVE, PAGE_NOACCESS);
   if (res == 0)
     Report("WARNING: %s failed to "
            "mprotect %p (%zd) bytes at %p (error code: %d)\n",
            SanitizerToolName, size, size, fixed_addr, GetLastError());
   return res;
+}
+
+void *MmapNoAccess(uptr size) {
+  // FIXME: unsupported.
+  return nullptr;
 }
 
 bool MprotectNoAccess(uptr addr, uptr size) {
@@ -319,6 +405,7 @@ void Abort() {
   internal__exit(3);
 }
 
+#ifndef SANITIZER_GO
 // Read the file to extract the ImageBase field from the PE header. If ASLR is
 // disabled and this virtual address is available, the loader will typically
 // load the image at this address. Therefore, we call it the preferred base. Any
@@ -371,7 +458,6 @@ static uptr GetPreferredBase(const char *modname) {
   return (uptr)pe_header->ImageBase;
 }
 
-#ifndef SANITIZER_GO
 void ListOfModules::init() {
   clear();
   HANDLE cur_process = GetCurrentProcess();
@@ -457,14 +543,15 @@ __declspec(allocate(".CRT$XID")) int (*__run_atexit)() = RunAtexit;
 
 // ------------------ sanitizer_libc.h
 fd_t OpenFile(const char *filename, FileAccessMode mode, error_t *last_error) {
+  // FIXME: Use the wide variants to handle Unicode filenames.
   fd_t res;
   if (mode == RdOnly) {
-    res = CreateFile(filename, GENERIC_READ,
-                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    res = CreateFileA(filename, GENERIC_READ,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   } else if (mode == WrOnly) {
-    res = CreateFile(filename, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                     FILE_ATTRIBUTE_NORMAL, nullptr);
+    res = CreateFileA(filename, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                      FILE_ATTRIBUTE_NORMAL, nullptr);
   } else {
     UNIMPLEMENTED();
   }
@@ -632,7 +719,7 @@ void BufferedStackTrace::SlowUnwindStack(uptr pc, u32 max_depth) {
   // FIXME: CaptureStackBackTrace might be too slow for us.
   // FIXME: Compare with StackWalk64.
   // FIXME: Look at LLVMUnhandledExceptionFilter in Signals.inc
-  size = CaptureStackBackTrace(2, Min(max_depth, kStackTraceMax),
+  size = CaptureStackBackTrace(1, Min(max_depth, kStackTraceMax),
                                (void**)trace, 0);
   if (size == 0)
     return;
@@ -647,6 +734,9 @@ void BufferedStackTrace::SlowUnwindStackWithContext(uptr pc, void *context,
   CONTEXT ctx = *(CONTEXT *)context;
   STACKFRAME64 stack_frame;
   memset(&stack_frame, 0, sizeof(stack_frame));
+
+  InitializeDbgHelpIfNeeded();
+
   size = 0;
 #if defined(_WIN64)
   int machine_type = IMAGE_FILE_MACHINE_AMD64;
@@ -767,10 +857,6 @@ uptr ReadLongProcessName(/*out*/char *buf, uptr buf_len) {
 
 void CheckVMASize() {
   // Do nothing.
-}
-
-void DisableReexec() {
-  // No need to re-exec on Windows.
 }
 
 void MaybeReexec() {
